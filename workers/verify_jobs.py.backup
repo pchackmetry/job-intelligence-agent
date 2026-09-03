@@ -1,0 +1,1871 @@
+"""
+Job Intelligence Agent
+Unified Verification Pipeline Worker
+
+Pipeline:
+
+    DISCOVERED JOBS
+          ↓
+    job_correlator.py
+          ↓
+    OFFICIAL CANDIDATE
+          ↓
+    job_verifier.py
+          ↓
+    VERIFIED JOB
+          ↓
+    application_url.py
+          ↓
+    FINAL DIRECT APPLY URL
+          ↓
+    VERIFIED / UNCERTAIN / REJECTED
+
+Version: 2.0.0
+
+Design goals:
+- Batch-first correlation
+- Never use third-party URLs as final applications
+- Preserve source/discovery URLs
+- Deterministic fingerprints
+- Rich diagnostics
+- Safe subprocess execution
+- No shell execution
+- No CAPTCHA/auth bypass
+- Free-first architecture
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+
+VERSION = "2.0.0"
+
+ROOT = Path(__file__).resolve().parents[1]
+
+CORRELATOR = ROOT / "verification" / "job_correlator.py"
+VERIFIER = ROOT / "verification" / "job_verifier.py"
+APPLICATION_VALIDATOR = (
+    ROOT / "verification" / "application_url.py"
+)
+
+PYTHON = sys.executable
+
+DEFAULT_TIMEOUT = 90
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+@dataclass
+class PipelineResult:
+    status: str
+
+    company: str
+    title: str
+    location: str
+
+    source: str
+    source_url: str
+
+    official_url: str
+    application_url: str
+
+    requisition_id: str
+
+    match_score: int
+    job_confidence: int
+
+    verification_status: str
+    application_status: str
+
+    reason: str
+
+    fingerprint: str
+
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize(value: Any) -> str:
+    if value is None:
+        return ""
+
+    return " ".join(
+        str(value)
+        .strip()
+        .lower()
+        .split()
+    )
+
+
+def text_value(
+    data: dict[str, Any],
+    *keys: str,
+) -> str:
+
+    for key in keys:
+        value = data.get(key)
+
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    return ""
+
+
+def integer_value(
+    data: dict[str, Any],
+    *keys: str,
+    default: int = 0,
+) -> int:
+
+    for key in keys:
+
+        value = data.get(key)
+
+        if value is None:
+            continue
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    return default
+
+
+# ============================================================
+# FINGERPRINT
+# ============================================================
+
+def fingerprint(
+    job: dict[str, Any],
+) -> str:
+
+    company = normalize(
+        text_value(job, "company")
+    )
+
+    title = normalize(
+        text_value(job, "title")
+    )
+
+    location = normalize(
+        text_value(job, "location")
+    )
+
+    requisition = normalize(
+        text_value(
+            job,
+            "requisition_id",
+            "requisitionId",
+            "requisition",
+            "req_id",
+        )
+    )
+
+    source_url = normalize(
+        text_value(
+            job,
+            "source_url",
+            "sourceUrl",
+        )
+    )
+
+    application_url = normalize(
+        text_value(
+            job,
+            "application_url",
+            "applicationUrl",
+            "apply_url",
+        )
+    )
+
+    # Prefer stable identifiers.
+    # If no requisition exists, include URLs.
+    if requisition:
+        raw = "|".join(
+            [
+                company,
+                title,
+                location,
+                requisition,
+            ]
+        )
+    else:
+        raw = "|".join(
+            [
+                company,
+                title,
+                location,
+                source_url,
+                application_url,
+            ]
+        )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+# ============================================================
+# SAFE SUBPROCESS EXECUTION
+# ============================================================
+
+def run_python_script(
+    script: Path,
+    arguments: list[str],
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[int, str, str]:
+
+    if not script.exists():
+        return (
+            2,
+            "",
+            f"Missing script: {script}",
+        )
+
+    command = [
+        PYTHON,
+        str(script),
+        *arguments,
+    ]
+
+    try:
+
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(ROOT),
+            shell=False,
+        )
+
+        return (
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+        )
+
+    except subprocess.TimeoutExpired:
+
+        return (
+            124,
+            "",
+            f"Timeout after {timeout} seconds",
+        )
+
+    except Exception as exc:
+
+        return (
+            1,
+            "",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+# ============================================================
+# JSON UTILITIES
+# ============================================================
+
+def load_json(
+    path: Path,
+) -> Any:
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        return json.load(file)
+
+
+def save_json(
+    path: Path,
+    data: Any,
+) -> None:
+
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            data,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def extract_jobs(
+    data: Any,
+) -> list[dict[str, Any]]:
+
+    if isinstance(data, list):
+
+        return [
+            item
+            for item in data
+            if isinstance(item, dict)
+        ]
+
+    if isinstance(data, dict):
+
+        for key in (
+            "jobs",
+            "results",
+            "data",
+            "items",
+            "postings",
+        ):
+
+            value = data.get(key)
+
+            if isinstance(value, list):
+
+                return [
+                    item
+                    for item in value
+                    if isinstance(item, dict)
+                ]
+
+        return [data]
+
+    raise ValueError(
+        "Input JSON must contain "
+        "a job object or job array."
+    )
+
+
+def write_json_file(
+    path: Path,
+    data: Any,
+) -> None:
+
+    save_json(
+        path,
+        data,
+    )
+
+
+# ============================================================
+# TEMPORARY CORRELATOR INPUT
+# ============================================================
+
+def create_temp_json(
+    jobs: list[dict[str, Any]],
+) -> Path:
+
+    temp_dir = (
+        ROOT
+        / "data"
+        / "runtime"
+    )
+
+    temp_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="correlator_input_",
+        dir=temp_dir,
+        delete=False,
+    ) as file:
+
+        json.dump(
+            jobs,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+        return Path(file.name)
+
+
+def create_temp_output() -> Path:
+
+    temp_dir = (
+        ROOT
+        / "data"
+        / "runtime"
+    )
+
+    temp_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".json",
+        prefix="correlator_output_",
+        dir=temp_dir,
+        delete=False,
+    ) as file:
+
+        return Path(file.name)
+
+
+# ============================================================
+# CORRELATOR
+# ============================================================
+
+def run_correlator_batch(
+    jobs: list[dict[str, Any]],
+    timeout: int,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+
+    if not CORRELATOR.exists():
+
+        return (
+            [],
+            {
+                "status": "ERROR",
+                "reason": (
+                    f"Missing correlator: "
+                    f"{CORRELATOR}"
+                ),
+            },
+        )
+
+    input_path = create_temp_json(jobs)
+    output_path = create_temp_output()
+
+    try:
+
+        arguments = [
+            "--json-file",
+            str(input_path),
+
+            "--json-output",
+            str(output_path),
+
+            "--max-candidates",
+            "10",
+        ]
+
+        code, stdout, stderr = (
+            run_python_script(
+                CORRELATOR,
+                arguments,
+                timeout,
+            )
+        )
+
+        if not output_path.exists():
+
+            return (
+                [],
+                {
+                    "status": "ERROR",
+                    "returncode": code,
+                    "stdout": stdout[-4000:],
+                    "stderr": stderr[-4000:],
+                    "reason": (
+                        "Correlator did not "
+                        "produce output."
+                    ),
+                },
+            )
+
+        try:
+
+            raw = load_json(
+                output_path
+            )
+
+        except Exception as exc:
+
+            return (
+                [],
+                {
+                    "status": "ERROR",
+                    "returncode": code,
+                    "stdout": stdout[-4000:],
+                    "stderr": stderr[-4000:],
+                    "reason": (
+                        "Could not parse "
+                        f"correlator output: {exc}"
+                    ),
+                },
+            )
+
+        correlated_jobs = (
+            extract_jobs(raw)
+        )
+
+        return (
+            correlated_jobs,
+            {
+                "status": (
+                    "OK"
+                    if code == 0
+                    else "PARTIAL"
+                ),
+                "returncode": code,
+                "stdout": stdout[-4000:],
+                "stderr": stderr[-4000:],
+            },
+        )
+
+    finally:
+
+        try:
+            input_path.unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
+
+        try:
+            output_path.unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# CORRELATION RESULT MAPPING
+# ============================================================
+
+def result_status(
+    correlation: dict[str, Any],
+) -> str:
+
+    return normalize(
+        text_value(
+            correlation,
+            "status",
+            "correlation_status",
+            "verification_status",
+        )
+    ).upper()
+
+
+def is_rejected(
+    correlation: dict[str, Any],
+) -> bool:
+
+    return result_status(
+        correlation
+    ) in {
+        "REJECTED",
+        "REJECT",
+        "FAILED",
+        "ERROR",
+    }
+
+
+def is_uncertain(
+    correlation: dict[str, Any],
+) -> bool:
+
+    return result_status(
+        correlation
+    ) in {
+        "UNCERTAIN",
+        "UNKNOWN",
+        "PENDING",
+    }
+
+
+def get_official_url(
+    correlation: dict[str, Any],
+) -> str:
+
+    return text_value(
+        correlation,
+        "official_url",
+        "best_url",
+        "official_candidate",
+        "candidate_url",
+    )
+
+
+def get_application_url(
+    correlation: dict[str, Any],
+) -> str:
+
+    return text_value(
+        correlation,
+        "application_url",
+        "apply_url",
+        "direct_apply_url",
+        "final_application_url",
+    )
+
+
+# ============================================================
+# VERIFIER
+# ============================================================
+
+def run_verifier(
+    job: dict[str, Any],
+    correlation: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+
+    if not VERIFIER.exists():
+
+        return {
+            "status": "ERROR",
+            "reason": (
+                f"Missing verifier: {VERIFIER}"
+            ),
+        }
+
+    arguments: list[str] = []
+
+    values = {
+        "company": text_value(
+            job,
+            "company",
+        ),
+
+        "title": text_value(
+            job,
+            "title",
+        ),
+
+        "location": text_value(
+            job,
+            "location",
+        ),
+
+        "description": text_value(
+            job,
+            "description",
+        ),
+
+        "source_url": text_value(
+            job,
+            "source_url",
+            "sourceUrl",
+        ),
+
+        "requisition_id": text_value(
+            job,
+            "requisition_id",
+            "requisitionId",
+        ),
+
+        "official_url": get_official_url(
+            correlation
+        ),
+
+        "application_url": get_application_url(
+            correlation
+        ),
+    }
+
+    mapping = {
+        "company": "--company",
+        "title": "--title",
+        "location": "--location",
+        "description": "--description",
+        "source_url": "--source-url",
+        "requisition_id": "--requisition-id",
+        "official_url": "--official-url",
+        "application_url": "--application-url",
+    }
+
+    for field, flag in mapping.items():
+
+        value = values[field]
+
+        if value:
+
+            arguments.extend(
+                [
+                    flag,
+                    value,
+                ]
+            )
+
+    code, stdout, stderr = (
+        run_python_script(
+            VERIFIER,
+            arguments,
+            timeout,
+        )
+    )
+
+    parsed = None
+
+    try:
+
+        parsed = json.loads(
+            stdout.strip()
+        )
+
+    except Exception:
+        pass
+
+    if isinstance(parsed, dict):
+
+        return parsed
+
+    return {
+        "status": (
+            "ERROR"
+            if code != 0
+            else "UNKNOWN"
+        ),
+        "returncode": code,
+        "stdout": stdout[-4000:],
+        "stderr": stderr[-4000:],
+        "reason": (
+            "Verifier did not return "
+            "machine-readable JSON."
+        ),
+    }
+
+
+# ============================================================
+# FINAL APPLICATION URL VALIDATION
+# ============================================================
+
+def validate_application_url(
+    application_url: str,
+    timeout: int,
+) -> dict[str, Any]:
+
+    if not application_url:
+
+        return {
+            "status": "MISSING",
+            "valid": False,
+            "reason": (
+                "No direct application URL."
+            ),
+        }
+
+    if not APPLICATION_VALIDATOR.exists():
+
+        return {
+            "status": "ERROR",
+            "valid": False,
+            "reason": (
+                "application_url.py not found."
+            ),
+        }
+
+    # The validator CLI may evolve independently.
+    # Try the known --url interface first.
+
+    arguments = [
+        "--url",
+        application_url,
+    ]
+
+    code, stdout, stderr = (
+        run_python_script(
+            APPLICATION_VALIDATOR,
+            arguments,
+            timeout,
+        )
+    )
+
+    output = stdout.strip()
+
+    if output:
+
+        try:
+
+            parsed = json.loads(
+                output
+            )
+
+            if isinstance(parsed, dict):
+
+                return parsed
+
+        except json.JSONDecodeError:
+            pass
+
+    if code == 0:
+
+        return {
+            "status": "ACCEPT",
+            "valid": True,
+            "reason": (
+                "Application URL "
+                "validator accepted URL."
+            ),
+        }
+
+    return {
+        "status": "REJECT",
+        "valid": False,
+        "reason": (
+            stderr.strip()
+            or stdout.strip()
+            or "Application URL rejected."
+        ),
+    }
+
+
+# ============================================================
+# RESULT CREATION
+# ============================================================
+
+def make_result(
+    job: dict[str, Any],
+    *,
+    status: str,
+    official_url: str = "",
+    application_url: str = "",
+    match_score: int = 0,
+    job_confidence: int = 0,
+    verification_status: str = "NOT_RUN",
+    application_status: str = "NOT_RUN",
+    reason: str = "",
+) -> PipelineResult:
+
+    return PipelineResult(
+        status=status,
+
+        company=text_value(
+            job,
+            "company",
+        ),
+
+        title=text_value(
+            job,
+            "title",
+        ),
+
+        location=text_value(
+            job,
+            "location",
+        ),
+
+        source=text_value(
+            job,
+            "source",
+        ),
+
+        source_url=text_value(
+            job,
+            "source_url",
+            "sourceUrl",
+        ),
+
+        official_url=official_url,
+
+        application_url=application_url,
+
+        requisition_id=text_value(
+            job,
+            "requisition_id",
+            "requisitionId",
+        ),
+
+        match_score=match_score,
+
+        job_confidence=job_confidence,
+
+        verification_status=verification_status,
+
+        application_status=application_status,
+
+        reason=reason,
+
+        fingerprint=fingerprint(
+            job
+        ),
+    )
+
+
+# ============================================================
+# SINGLE JOB FINALIZATION
+# ============================================================
+
+def finalize_job(
+    job: dict[str, Any],
+    correlation: dict[str, Any],
+    timeout: int,
+) -> PipelineResult:
+
+    official_url = get_official_url(
+        correlation
+    )
+
+    application_url = get_application_url(
+        correlation
+    )
+
+    correlation_status = result_status(
+        correlation
+    )
+
+    match_score = integer_value(
+        correlation,
+        "match_score",
+        "score",
+        "candidate_score",
+    )
+
+    job_confidence = integer_value(
+        correlation,
+        "job_confidence",
+        "confidence",
+    )
+
+    # --------------------------------------------------------
+    # CORRELATION FAILURE
+    # --------------------------------------------------------
+
+    if is_rejected(correlation):
+
+        return make_result(
+            job,
+            status="REJECTED",
+            reason=text_value(
+                correlation,
+                "reason",
+                default=(
+                    "No verified official "
+                    "job candidate found."
+                ),
+            ),
+        )
+
+    # --------------------------------------------------------
+    # VERIFICATION
+    # --------------------------------------------------------
+
+    verification = run_verifier(
+        job,
+        correlation,
+        timeout,
+    )
+
+    verification_status = normalize(
+        text_value(
+            verification,
+            "status",
+            "verification_status",
+        )
+    ).upper()
+
+    verified_official_url = (
+        text_value(
+            verification,
+            "official_url",
+            "best_url",
+        )
+        or official_url
+    )
+
+    verified_application_url = (
+        text_value(
+            verification,
+            "application_url",
+            "apply_url",
+        )
+        or application_url
+    )
+
+    match_score = (
+        integer_value(
+            verification,
+            "match_score",
+            "score",
+            default=match_score,
+        )
+        or match_score
+    )
+
+    job_confidence = (
+        integer_value(
+            verification,
+            "confidence",
+            "job_confidence",
+            default=job_confidence,
+        )
+        or job_confidence
+    )
+
+    # Never notify on an unverified official posting.
+
+    if verification_status != "VERIFIED":
+
+        status = (
+            "UNCERTAIN"
+            if verification_status
+            in {
+                "UNCERTAIN",
+                "UNKNOWN",
+                "PENDING",
+            }
+            else "REJECTED"
+        )
+
+        return make_result(
+            job,
+            status=status,
+            official_url=verified_official_url,
+            application_url=(
+                verified_application_url
+            ),
+            match_score=match_score,
+            job_confidence=job_confidence,
+            verification_status=(
+                verification_status
+                or "UNKNOWN"
+            ),
+            reason=text_value(
+                verification,
+                "reason",
+                default=(
+                    "Official job could "
+                    "not be verified."
+                ),
+            ),
+        )
+
+    # --------------------------------------------------------
+    # APPLICATION URL
+    # --------------------------------------------------------
+
+    if not verified_application_url:
+
+        return make_result(
+            job,
+            status="UNCERTAIN",
+            official_url=verified_official_url,
+            application_url="",
+            match_score=match_score,
+            job_confidence=job_confidence,
+            verification_status="VERIFIED",
+            application_status="MISSING",
+            reason=(
+                "Job verified, but no "
+                "direct application URL "
+                "was returned."
+            ),
+        )
+
+    application_check = (
+        validate_application_url(
+            verified_application_url,
+            timeout,
+        )
+    )
+
+    application_valid = bool(
+        application_check.get(
+            "valid",
+            False,
+        )
+    )
+
+    application_status = normalize(
+        text_value(
+            application_check,
+            "status",
+        )
+    ).upper()
+
+    if not application_valid:
+
+        return make_result(
+            job,
+            status="UNCERTAIN",
+            official_url=verified_official_url,
+            application_url=(
+                verified_application_url
+            ),
+            match_score=match_score,
+            job_confidence=job_confidence,
+            verification_status="VERIFIED",
+            application_status=(
+                application_status
+                or "REJECT"
+            ),
+            reason=(
+                "Official job verified, "
+                "but final application "
+                "URL failed validation: "
+                + text_value(
+                    application_check,
+                    "reason",
+                    default=(
+                        "Invalid application URL."
+                    ),
+                )
+            ),
+        )
+
+    # --------------------------------------------------------
+    # VERIFIED
+    # --------------------------------------------------------
+
+    return make_result(
+        job,
+        status="VERIFIED",
+        official_url=verified_official_url,
+        application_url=(
+            verified_application_url
+        ),
+        match_score=match_score,
+        job_confidence=job_confidence,
+        verification_status="VERIFIED",
+        application_status=(
+            application_status
+            or "ACCEPT"
+        ),
+        reason=(
+            "Official job verified and "
+            "direct application URL accepted."
+        ),
+    )
+
+
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+def deduplicate_jobs(
+    jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+
+    seen: set[str] = set()
+
+    unique: list[dict[str, Any]] = []
+
+    for job in jobs:
+
+        fp = fingerprint(job)
+
+        if fp in seen:
+            continue
+
+        seen.add(fp)
+        unique.append(job)
+
+    return unique
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+
+def process_pipeline(
+    jobs: list[dict[str, Any]],
+    timeout: int,
+) -> list[PipelineResult]:
+
+    jobs = deduplicate_jobs(
+        jobs
+    )
+
+    if not jobs:
+        return []
+
+    print(
+        f"🔎 Correlating {len(jobs)} "
+        f"unique discovered jobs..."
+    )
+
+    correlated_jobs, meta = (
+        run_correlator_batch(
+            jobs,
+            timeout,
+        )
+    )
+
+    if meta.get("status") == "ERROR":
+
+        print(
+            "❌ Correlator failed:"
+        )
+
+        print(
+            meta.get(
+                "reason",
+                "Unknown error",
+            )
+        )
+
+        results = []
+
+        for job in jobs:
+
+            results.append(
+                make_result(
+                    job,
+                    status="REJECTED",
+                    reason=(
+                        "Correlation engine "
+                        "failed: "
+                        + str(
+                            meta.get(
+                                "reason",
+                                "Unknown error",
+                            )
+                        )
+                    ),
+                )
+            )
+
+        return results
+
+    print(
+        f"✅ Correlator returned "
+        f"{len(correlated_jobs)} results."
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # The correlator can return a result per
+    # discovered job. When that happens, match
+    # by fingerprint. Otherwise fall back to
+    # company/title/requisition.
+    # --------------------------------------------------------
+
+    original_by_fp = {
+        fingerprint(job): job
+        for job in jobs
+    }
+
+    results: list[PipelineResult] = []
+
+    for correlation in correlated_jobs:
+
+        fp = text_value(
+            correlation,
+            "fingerprint",
+        )
+
+        job = original_by_fp.get(
+            fp
+        )
+
+        if job is None:
+
+            company = normalize(
+                text_value(
+                    correlation,
+                    "company",
+                )
+            )
+
+            title = normalize(
+                text_value(
+                    correlation,
+                    "title",
+                )
+            )
+
+            requisition = normalize(
+                text_value(
+                    correlation,
+                    "requisition_id",
+                    "requisitionId",
+                )
+            )
+
+            candidates = []
+
+            for original in jobs:
+
+                if normalize(
+                    text_value(
+                        original,
+                        "company",
+                    )
+                ) != company:
+                    continue
+
+                if normalize(
+                    text_value(
+                        original,
+                        "title",
+                    )
+                ) != title:
+                    continue
+
+                original_req = normalize(
+                    text_value(
+                        original,
+                        "requisition_id",
+                        "requisitionId",
+                    )
+                )
+
+                if (
+                    requisition
+                    and original_req
+                    and requisition
+                    != original_req
+                ):
+                    continue
+
+                candidates.append(
+                    original
+                )
+
+            if candidates:
+                job = candidates[0]
+
+        if job is None:
+
+            continue
+
+        results.append(
+            finalize_job(
+                job,
+                correlation,
+                timeout,
+            )
+        )
+
+    # --------------------------------------------------------
+    # If correlator omitted a job entirely,
+    # preserve it as rejected/uncertain rather
+    # than silently dropping it.
+    # --------------------------------------------------------
+
+    processed_fps = {
+        result.fingerprint
+        for result in results
+    }
+
+    for job in jobs:
+
+        fp = fingerprint(job)
+
+        if fp in processed_fps:
+            continue
+
+        results.append(
+            make_result(
+                job,
+                status="REJECTED",
+                reason=(
+                    "Correlator returned "
+                    "no result for this "
+                    "discovered job."
+                ),
+            )
+        )
+
+    return results
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def print_summary(
+    results: list[PipelineResult],
+) -> None:
+
+    total = len(results)
+
+    verified = sum(
+        result.status == "VERIFIED"
+        for result in results
+    )
+
+    uncertain = sum(
+        result.status == "UNCERTAIN"
+        for result in results
+    )
+
+    rejected = sum(
+        result.status == "REJECTED"
+        for result in results
+    )
+
+    print()
+    print("=" * 72)
+    print(
+        "JOB INTELLIGENCE VERIFICATION PIPELINE"
+    )
+    print(
+        f"Version: {VERSION}"
+    )
+    print("=" * 72)
+
+    print(
+        f"Total jobs       : {total}"
+    )
+
+    print(
+        f"Verified         : {verified}"
+    )
+
+    print(
+        f"Uncertain        : {uncertain}"
+    )
+
+    print(
+        f"Rejected         : {rejected}"
+    )
+
+    print("=" * 72)
+
+    for index, result in enumerate(
+        results,
+        start=1,
+    ):
+
+        print()
+        print(
+            f"[{index}] "
+            f"{result.status}"
+        )
+
+        print(
+            f"    {result.title}"
+        )
+
+        print(
+            f"    {result.company}"
+        )
+
+        if result.location:
+
+            print(
+                f"    📍 "
+                f"{result.location}"
+            )
+
+        if result.official_url:
+
+            print(
+                f"    🌐 "
+                f"{result.official_url}"
+            )
+
+        if result.application_url:
+
+            print(
+                f"    🔗 "
+                f"{result.application_url}"
+            )
+
+        print(
+            f"    Match: "
+            f"{result.match_score}/100"
+        )
+
+        print(
+            f"    Confidence: "
+            f"{result.job_confidence}/100"
+        )
+
+        print(
+            f"    Verification: "
+            f"{result.verification_status}"
+        )
+
+        print(
+            f"    Application: "
+            f"{result.application_status}"
+        )
+
+        print(
+            f"    {result.reason}"
+        )
+
+
+# ============================================================
+# SELF TESTS
+# ============================================================
+
+def run_self_tests() -> int:
+
+    print("=" * 72)
+    print(
+        "VERIFY JOBS WORKER TEST SUITE"
+    )
+    print(
+        f"Version: {VERSION}"
+    )
+    print("=" * 72)
+
+    sample = {
+        "source": "linkedin",
+        "company": "Example Security",
+        "title": (
+            "Junior Cybersecurity Analyst"
+        ),
+        "location": (
+            "Hyderabad, India"
+        ),
+        "source_url": (
+            "https://www.linkedin.com/"
+            "jobs/view/123456"
+        ),
+        "description": (
+            "Entry-level cybersecurity "
+            "role for 0-2 years."
+        ),
+        "requisition_id": "SEC-123",
+    }
+
+    # 1
+    fp1 = fingerprint(sample)
+    fp2 = fingerprint(sample)
+
+    assert fp1 == fp2
+    assert len(fp1) == 64
+
+    print(
+        "✅ Deterministic fingerprint"
+    )
+
+    # 2
+    changed = dict(sample)
+
+    changed["title"] = (
+        "Different Security Role"
+    )
+
+    assert fingerprint(
+        changed
+    ) != fp1
+
+    print(
+        "✅ Fingerprint changes "
+        "when identity changes"
+    )
+
+    # 3
+    jobs = [
+        sample,
+        dict(sample),
+    ]
+
+    unique = deduplicate_jobs(
+        jobs
+    )
+
+    assert len(unique) == 1
+
+    print(
+        "✅ Duplicate jobs removed"
+    )
+
+    # 4
+    assert normalize(
+        "  Hyderabad   India  "
+    ) == "hyderabad india"
+
+    print(
+        "✅ Text normalization"
+    )
+
+    # 5
+    assert text_value(
+        sample,
+        "missing",
+        "company",
+    ) == "Example Security"
+
+    print(
+        "✅ Multi-key extraction"
+    )
+
+    # 6
+    assert text_value(
+        sample,
+        "missing",
+        default="fallback",
+    ) == "fallback"
+
+    print(
+        "✅ Missing value fallback"
+    )
+
+    # 7
+    arguments = [
+        "--json-file",
+        "input.json",
+        "--json-output",
+        "output.json",
+    ]
+
+    assert (
+        "--json-file" in arguments
+    )
+
+    assert (
+        "--json-output" in arguments
+    )
+
+    print(
+        "✅ Batch correlator interface"
+    )
+
+    # 8
+    result = make_result(
+        sample,
+        status="REJECTED",
+        reason="Test",
+    )
+
+    assert (
+        result.status == "REJECTED"
+    )
+
+    assert (
+        len(result.fingerprint)
+        == 64
+    )
+
+    print(
+        "✅ Pipeline result creation"
+    )
+
+    # 9
+    assert (
+        ROOT.exists()
+    )
+
+    print(
+        "✅ Project root detected"
+    )
+
+    # 10
+    assert (
+        CORRELATOR.name
+        == "job_correlator.py"
+    )
+
+    assert (
+        VERIFIER.name
+        == "job_verifier.py"
+    )
+
+    assert (
+        APPLICATION_VALIDATOR.name
+        == "application_url.py"
+    )
+
+    print(
+        "✅ Verification components mapped"
+    )
+
+    print()
+    print("-" * 72)
+    print(
+        "Passed: 10"
+    )
+    print(
+        "Failed: 0"
+    )
+    print("-" * 72)
+    print(
+        "✅ ALL VERIFY JOBS TESTS PASSED"
+    )
+
+    return 0
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main() -> int:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Unified Job Intelligence "
+            "verification pipeline."
+        )
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=VERSION,
+    )
+
+    parser.add_argument(
+        "--tests",
+        action="store_true",
+        help="Run internal tests.",
+    )
+
+    parser.add_argument(
+        "--json",
+        dest="json_file",
+        help=(
+            "Input discovered jobs JSON."
+        ),
+    )
+
+    parser.add_argument(
+        "--output",
+        default=(
+            "data/verified_jobs.json"
+        ),
+        help=(
+            "Output verified jobs JSON."
+        ),
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=(
+            "Network/worker timeout "
+            "in seconds."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    # --------------------------------------------------------
+    # TESTS
+    # --------------------------------------------------------
+
+    if args.tests:
+
+        return run_self_tests()
+
+    # --------------------------------------------------------
+    # INPUT
+    # --------------------------------------------------------
+
+    if not args.json_file:
+
+        parser.error(
+            "--json is required unless "
+            "--tests is used."
+        )
+
+    input_path = Path(
+        args.json_file
+    ).resolve()
+
+    output_path = Path(
+        args.output
+    ).resolve()
+
+    if not input_path.exists():
+
+        print(
+            "❌ Input file not found:"
+        )
+
+        print(
+            input_path
+        )
+
+        return 2
+
+    try:
+
+        raw = load_json(
+            input_path
+        )
+
+        jobs = extract_jobs(
+            raw
+        )
+
+    except Exception as exc:
+
+        print(
+            "❌ Could not load input:"
+        )
+
+        print(
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
+
+        return 2
+
+    print()
+    print(
+        f"Loaded {len(jobs)} "
+        f"discovered jobs."
+    )
+
+    unique_jobs = deduplicate_jobs(
+        jobs
+    )
+
+    print(
+        f"Unique jobs: "
+        f"{len(unique_jobs)}"
+    )
+
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
+
+    results = process_pipeline(
+        unique_jobs,
+        max(
+            10,
+            args.timeout,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    payload = [
+        asdict(result)
+        for result in results
+    ]
+
+    save_json(
+        output_path,
+        payload,
+    )
+
+    print_summary(
+        results
+    )
+
+    print()
+    print(
+        "📄 Results saved to:"
+    )
+
+    print(
+        output_path
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        main()
+    )

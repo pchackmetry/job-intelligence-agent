@@ -5,29 +5,42 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+permissions:
+  contents: read
+
 jobs:
   run-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install core dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f workers/ats-scrapers/pipeline/requirements.txt ]; then pip install -r workers/ats-scrapers/pipeline/requirements.txt; fi
+          python -m pip install requests beautifulsoup4 lxml
 
-      - name: Run discovery
+      - name: Install ATS scrapers
+        run: |
+          python -m pip install -e ./workers/ats-scrapers
+
+      - name: Verify Python environment
+        run: |
+          python --version
+          python -c "import ats_scrapers; print('ats_scrapers: OK')"
+
+      - name: Run cloud job agent
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONIOENCODING: utf-8
         run: |
-          python workers/continuous_discovery.py
+          python workers/cloud_job_agent.py

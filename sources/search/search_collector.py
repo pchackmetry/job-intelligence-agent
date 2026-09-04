@@ -695,6 +695,16 @@ def parse_google_results(
     query: str,
     limit: int,
 ) -> list[dict[str, Any]]:
+    """
+    Parse Google public search HTML.
+
+    Primary parser:
+        Google result containers.
+
+    Fallback parser:
+        Generic anchors/headings when Google's
+        container class names change.
+    """
 
     if not html:
         return []
@@ -703,6 +713,16 @@ def parse_google_results(
         html,
         "html.parser",
     )
+
+    results: list[
+        dict[str, Any]
+    ] = []
+
+    seen_urls: set[str] = set()
+
+    # --------------------------------------------------------
+    # PRIMARY GOOGLE SELECTORS
+    # --------------------------------------------------------
 
     nodes = (
         soup.select(
@@ -715,10 +735,6 @@ def parse_google_results(
             "div.g"
         )
     )
-
-    results: list[
-        dict[str, Any]
-    ] = []
 
     for node in nodes:
 
@@ -762,6 +778,9 @@ def parse_google_results(
         if not url:
             continue
 
+        if url in seen_urls:
+            continue
+
         title = normalize_title(
             heading.get_text(
                 " ",
@@ -802,6 +821,133 @@ def parse_google_results(
                 "url": url,
                 "snippet": snippet,
             }
+        )
+
+        seen_urls.add(
+            url
+        )
+
+        if len(results) >= limit:
+            return results
+
+    # --------------------------------------------------------
+    # FALLBACK GOOGLE PARSER
+    # --------------------------------------------------------
+
+    for anchor in soup.find_all(
+        "a",
+        href=True,
+    ):
+
+        href = anchor.get(
+            "href",
+            "",
+        )
+
+        url = unwrap_google_url(
+            href
+        )
+
+        if not url:
+            continue
+
+        if (
+            classify_url(url)
+            == "search_engine"
+        ):
+            continue
+
+        if url in seen_urls:
+            continue
+
+        # ----------------------------------------------------
+        # Find a useful title.
+        # ----------------------------------------------------
+
+        heading = anchor.find(
+            [
+                "h3",
+                "h2",
+                "h1",
+            ]
+        )
+
+        if heading:
+
+            title = normalize_title(
+                heading.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+        else:
+
+            title = normalize_title(
+                anchor.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+        # Ignore useless/navigation links.
+        if (
+            not title
+            or len(title) < 4
+            or len(title) > 300
+        ):
+            continue
+
+        lowered = title.lower()
+
+        if lowered in {
+            "images",
+            "videos",
+            "news",
+            "maps",
+            "shopping",
+            "more",
+            "sign in",
+            "settings",
+            "tools",
+            "next",
+            "previous",
+        }:
+            continue
+
+        # ----------------------------------------------------
+        # Try to obtain nearby text as snippet.
+        # ----------------------------------------------------
+
+        parent = anchor.parent
+
+        snippet = ""
+
+        if parent:
+
+            snippet = normalize_text(
+                parent.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
+
+            # Prevent huge page fragments.
+            if len(snippet) > 500:
+
+                snippet = snippet[:500]
+
+        results.append(
+            {
+                "query": query,
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+            }
+        )
+
+        seen_urls.add(
+            url
         )
 
         if len(results) >= limit:

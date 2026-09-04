@@ -1480,6 +1480,11 @@ def collect(
         stats.raw_results += (
             len(parsed)
         )
+        if not parsed:
+    print(
+        "   WARNING: Search request succeeded "
+        "but no result links were parsed."
+    )
 
         print(
             f"   Results: "

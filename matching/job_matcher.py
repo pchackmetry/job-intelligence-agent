@@ -26,3 +26,16 @@ if fresher_friendly:
     score += 20
 else:
     score += 5
+
+
+return {
+    "matched": True,
+    "category": category,
+    "match_score": score,
+    "india_eligible": True,
+    "fresher_friendly": fresher_friendly,
+    "fresher_status": fresher_status,
+    "role": role["group"],
+    "matched_role": role["role"],
+    "reason": "TECHNICAL_FRESHER_MATCH",
+}

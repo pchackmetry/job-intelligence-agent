@@ -8,12 +8,15 @@ fresher_friendly = has_fresher_signal(
     description,
 )
 
-if not fresher_friendly:
-    return {
-        "matched": False,
-        "category": "EXPERIENCE_MISMATCH",
-        "match_score": 0,
-        "india_eligible": True,
-        "fresher_friendly": False,
-        "reason": "NO_FRESHER_SIGNAL",
-    }
+# Do not reject a target-role job solely because the
+# employer did not explicitly use "fresher", "junior",
+# or "entry level".
+#
+# Explicit senior titles and explicit experience
+# mismatches are already rejected earlier.
+
+fresher_status = (
+    "CONFIRMED"
+    if fresher_friendly
+    else "UNCONFIRMED"
+)

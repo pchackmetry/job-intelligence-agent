@@ -20,3 +20,9 @@ fresher_status = (
     if fresher_friendly
     else "UNCONFIRMED"
 )
+
+# Fresher signal
+if fresher_friendly:
+    score += 20
+else:
+    score += 5

@@ -12,11 +12,9 @@ from pathlib import Path
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 DATA_DIR = PROJECT_ROOT / "data"
 
 DISCOVERY_FILE = DATA_DIR / "discovery_queries.json"
-
 SEARCH_RESULTS_FILE = DATA_DIR / "search_results.json"
 
 
@@ -28,18 +26,28 @@ def run_step(
     name: str,
     command: list[str],
 ) -> None:
-
     print()
-
     print("=" * 70)
     print(f"▶ {name}")
     print("=" * 70)
 
+    print("Command:")
+    print(" ".join(command))
+    print()
+
     result = subprocess.run(
         command,
-        cwd=PROJECT_ROOT,
+        cwd=str(PROJECT_ROOT),
         check=False,
         env=os.environ.copy(),
+        text=True,
+    )
+
+    print()
+
+    print(
+        f"{name} exit code: "
+        f"{result.returncode}"
     )
 
     if result.returncode != 0:
@@ -50,155 +58,115 @@ def run_step(
 
 
 # ============================================================
-# DISCOVERY OUTPUT
-# ============================================================
-
-def find_discovery_file() -> Path:
-    """
-    Find the discovery JSON produced by the discovery engine.
-
-    Preferred:
-        data/discovery_queries.json
-
-    Fallback:
-        newest discovery*.json file.
-    """
-
-    if DISCOVERY_FILE.exists():
-        return DISCOVERY_FILE
-
-    candidates = sorted(
-        DATA_DIR.glob("*.json"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
-
-    for path in candidates:
-
-        if (
-            "discovery" in path.name.lower()
-            and path != SEARCH_RESULTS_FILE
-        ):
-            return path
-
-    raise FileNotFoundError(
-        "No discovery JSON file was produced."
-    )
-
-
-# ============================================================
-# DISCOVERY VALIDATION
+# DISCOVERY FILE
 # ============================================================
 
 def validate_discovery_file(
     path: Path,
 ) -> int:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Discovery file does not exist: {path}"
+        )
+
+    if path.stat().st_size == 0:
+        raise RuntimeError(
+            f"Discovery file is empty: {path}"
+        )
 
     try:
-
         data = json.loads(
             path.read_text(
-                encoding="utf-8",
+                encoding="utf-8"
             )
         )
 
     except Exception as exc:
-
         raise RuntimeError(
-            f"Unable to read discovery file "
-            f"{path}: {exc}"
+            f"Invalid discovery JSON: {exc}"
         ) from exc
 
     if isinstance(data, dict):
-
         queries = data.get(
             "queries",
-            [],
+            []
         )
 
     elif isinstance(data, list):
-
         queries = data
 
     else:
-
         queries = []
 
     if not isinstance(
         queries,
-        list,
+        list
     ):
         queries = []
 
     if not queries:
-
         raise RuntimeError(
-            f"Discovery file contains no queries: "
-            f"{path}"
+            "Discovery file contains zero queries."
         )
 
     print(
-        f"Discovery queries available: "
-        f"{len(queries)}"
+        f"Discovery file: {path}"
+    )
+
+    print(
+        f"Discovery queries: {len(queries)}"
     )
 
     return len(queries)
 
 
 # ============================================================
-# SEARCH RESULT VALIDATION
+# SEARCH OUTPUT
 # ============================================================
 
 def validate_search_output(
     path: Path,
 ) -> int:
-
     if not path.exists():
-
         raise RuntimeError(
-            f"Search collector did not create "
-            f"{path}"
+            f"Search collector did not create: {path}"
+        )
+
+    if path.stat().st_size == 0:
+        raise RuntimeError(
+            f"Search output is empty: {path}"
         )
 
     try:
-
         data = json.loads(
             path.read_text(
-                encoding="utf-8",
+                encoding="utf-8"
             )
         )
 
     except Exception as exc:
-
         raise RuntimeError(
-            f"Unable to read search result file: "
-            f"{exc}"
+            f"Invalid search-results JSON: {exc}"
         ) from exc
 
     if isinstance(data, dict):
-
         results = data.get(
             "results",
-            [],
+            []
         )
-
     elif isinstance(data, list):
-
         results = data
-
     else:
-
         results = []
 
     if not isinstance(
         results,
-        list,
+        list
     ):
         results = []
 
     print(
-        f"Web search results collected: "
-        f"{len(results)}"
+        f"Search results: {len(results)}"
     )
 
     return len(results)
@@ -217,9 +185,9 @@ def main() -> None:
         exist_ok=True,
     )
 
-    # ========================================================
-    # 1. DISCOVERY / OSINT QUERY GENERATION
-    # ========================================================
+    # --------------------------------------------------------
+    # 1. JOB DISCOVERY
+    # --------------------------------------------------------
 
     run_step(
         "JOB DISCOVERY",
@@ -231,38 +199,26 @@ def main() -> None:
         ],
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 2. VALIDATE DISCOVERY
-    # ========================================================
-
-    discovery_path = find_discovery_file()
+    # --------------------------------------------------------
 
     query_count = validate_discovery_file(
-        discovery_path
+        DISCOVERY_FILE
     )
 
-    print(
-        f"Using discovery file: "
-        f"{discovery_path}"
-    )
-
-    # ========================================================
-    # 3. ACTUAL WEB SEARCH
-    # ========================================================
-
-    # Keep the number bounded for GitHub Actions.
-    #
-    # The collector already:
-    #   - searches public pages
-    #   - parses Google results
-    #   - detects blocking/interstitials
-    #   - falls back safely when possible
-    #
-    # No CAPTCHA or anti-bot bypass is attempted.
+    # --------------------------------------------------------
+    # 3. WEB SEARCH COLLECTION
+    # --------------------------------------------------------
 
     max_queries = min(
         query_count,
-        50,
+        20,
+    )
+
+    print()
+    print(
+        f"Running {max_queries} public search queries."
     )
 
     run_step(
@@ -271,7 +227,7 @@ def main() -> None:
             python,
             "sources/search/search_collector.py",
             "--input",
-            str(discovery_path),
+            str(DISCOVERY_FILE),
             "--output",
             str(SEARCH_RESULTS_FILE),
             "--max-queries",
@@ -285,17 +241,17 @@ def main() -> None:
         ],
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 4. VALIDATE SEARCH RESULTS
-    # ========================================================
+    # --------------------------------------------------------
 
     validate_search_output(
         SEARCH_RESULTS_FILE
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 5. ATS INGESTION
-    # ========================================================
+    # --------------------------------------------------------
 
     run_step(
         "ATS INGESTION",
@@ -307,9 +263,9 @@ def main() -> None:
         ],
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 6. JOB MATCHING
-    # ========================================================
+    # --------------------------------------------------------
 
     run_step(
         "JOB MATCHING",
@@ -319,9 +275,9 @@ def main() -> None:
         ],
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 7. JOB VERIFICATION
-    # ========================================================
+    # --------------------------------------------------------
 
     run_step(
         "JOB VERIFICATION",
@@ -331,9 +287,9 @@ def main() -> None:
         ],
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 8. TELEGRAM ALERTS
-    # ========================================================
+    # --------------------------------------------------------
 
     run_step(
         "TELEGRAM ALERTS",
@@ -344,24 +300,15 @@ def main() -> None:
         ],
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # COMPLETE
-    # ========================================================
+    # --------------------------------------------------------
 
     print()
-
+    print("=" * 70)
+    print("✅ CLOUD JOB AGENT COMPLETE")
     print("=" * 70)
 
-    print(
-        "✅ CLOUD JOB AGENT COMPLETE"
-    )
-
-    print("=" * 70)
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
